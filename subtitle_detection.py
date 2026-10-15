@@ -66,7 +66,7 @@ def detect_bottom_band(path, sample_interval=1.0, max_samples=600,
                 bottom = float(np.max(box[:, 1]))
                 center_x = (left + right) / 2
                 line_height = bottom - top
-                if not (0.15 * width <= center_x <= 0.85 * width):
+                if not (0.05 * width <= center_x <= 0.95 * width):
                     continue
                 if top < 0.65 * height or bottom > height:
                     continue
