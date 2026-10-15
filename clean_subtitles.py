@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Crop or strongly blur a configurable band at the bottom of videos."""
+"""Automatically find and crop or blur burned-in bottom subtitles."""
 
 import argparse
 import json
