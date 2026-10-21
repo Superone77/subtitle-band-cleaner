@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from subtitle_detection import detect_bottom_band
@@ -43,16 +44,89 @@ def inputs_at(path):
     if path.is_file():
         if path.suffix.lower() not in VIDEO_SUFFIXES:
             raise ValueError("Input must be an MP4, MOV, or MKV video")
+        if is_processed(path):
+            raise ValueError("Input is already a processed output: " + str(path))
         return [path]
     if path.is_dir():
         files = sorted(
             item for item in path.iterdir()
             if item.is_file() and item.suffix.lower() in VIDEO_SUFFIXES
+            and not item.name.startswith(".") and not is_processed(item)
         )
         if not files:
             raise ValueError("No MP4, MOV, or MKV videos in " + str(path))
         return files
     raise ValueError("Input does not exist: " + str(path))
+
+
+def is_processed(path):
+    return path.stem.endswith(("_subtitle_blurred", "_subtitle_cropped"))
+
+
+def base_stem(path):
+    stem = path.stem
+    while stem.endswith(("_no_subtitle", "_with_subtitle")):
+        stem = stem.rsplit("_", 2)[0]
+    return stem
+
+
+def rename_original(source, classified):
+    if source == classified:
+        return
+    if classified.exists():
+        raise ValueError("Will not overwrite another original: " + str(classified))
+    source.rename(classified)
+
+
+def process_video(source, args):
+    estimate = detect_bottom_band(
+        source, args.sample_interval, args.max_samples,
+        margin_pixels=args.margin_pixels,
+        min_distinct_captions=args.min_distinct_captions,
+        alignment=args.alignment)
+    has_subtitles = estimate.has_subtitles or args.force_process
+    tag = "with_subtitle" if has_subtitles else "no_subtitle"
+    stem = base_stem(source)
+    classified = source.with_name(stem + "_" + tag + source.suffix)
+    if source != classified and classified.exists():
+        raise ValueError("Will not overwrite another original: " + str(classified))
+    percent = args.bottom_percent if args.bottom_percent is not None else estimate.bottom_percent
+    target = None
+    if has_subtitles and not args.classify_only:
+        suffix = "subtitle_cropped" if args.mode == "crop" else "subtitle_blurred"
+        target = args.output / (stem + "_" + suffix + ".mp4")
+        if target.exists() and not args.overwrite:
+            raise ValueError("Output already exists (use --overwrite): " + str(target))
+        ffmpeg = ffmpeg_executable(args.ffmpeg)
+        with tempfile.NamedTemporaryFile(dir=args.output, prefix="." + stem + ".",
+                                         suffix=".partial.mp4", delete=False) as file:
+            temporary = Path(file.name)
+        print("{}: subtitles detected; {} bottom {:.1f}% -> {}".format(
+            source.name, args.mode, percent, target), flush=True)
+        try:
+            subprocess.run(make_command(ffmpeg, source, temporary, args.mode,
+                                        percent, args.crf, args.preset), check=True)
+            rename_original(source, classified)
+            os.replace(str(temporary), str(target))
+        finally:
+            temporary.unlink(missing_ok=True)
+    else:
+        rename_original(source, classified)
+        print("{}: {} -> {} (video bytes unchanged)".format(
+            source.name, tag, classified), flush=True)
+    report = {
+        "input": source.name,
+        "classified_input": str(classified),
+        "has_subtitles": has_subtitles,
+        "processed": target is not None,
+        "forced": args.force_process,
+        "output": target.name if target else None,
+        "mode": args.mode if target else None,
+        "bottom_percent": percent if has_subtitles else None,
+        "detection": estimate.as_dict(),
+    }
+    report_path = target.with_suffix(".json") if target else args.output / (stem + "_" + tag + ".json")
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
 def video_filter(mode, percent):
@@ -88,7 +162,15 @@ def main(argv=None):
     parser.add_argument("output", type=Path, help="output directory")
     parser.add_argument("--mode", choices=("crop", "blur"), default="crop")
     parser.add_argument("--bottom-percent", type=percentage,
-                        help="manual override; by default OCR detects each video's band")
+                        help="override band height after detection; does not force processing")
+    parser.add_argument("--classify-only", action="store_true",
+                        help="detect and rename originals without encoding outputs")
+    parser.add_argument("--force-process", action="store_true",
+                        help="process even without OCR evidence; requires --bottom-percent")
+    parser.add_argument("--min-distinct-captions", type=int, default=3,
+                        help="minimum different captions at a consistent position (default: 3)")
+    parser.add_argument("--alignment", choices=("center", "any"), default="center",
+                        help="candidate caption alignment (default: center)")
     parser.add_argument("--sample-interval", type=float, default=1.0,
                         help="seconds between OCR samples (default: 1)")
     parser.add_argument("--max-samples", type=int, default=600,
@@ -108,46 +190,20 @@ def main(argv=None):
             raise ValueError("CRF must be between 0 and 51")
         if args.sample_interval <= 0 or args.max_samples < 1 or args.margin_pixels < 0:
             raise ValueError("Sample interval and max samples must be positive; margin cannot be negative")
+        if args.min_distinct_captions < 1:
+            raise ValueError("Minimum distinct captions must be positive")
+        if args.force_process and args.bottom_percent is None:
+            raise ValueError("--force-process requires --bottom-percent")
         sources = inputs_at(args.input)
-        ffmpeg = ffmpeg_executable(args.ffmpeg)
         args.output.mkdir(parents=True, exist_ok=True)
+        failed = 0
         for source in sources:
-            estimate = None
-            if args.bottom_percent is None:
-                estimate = detect_bottom_band(source, args.sample_interval,
-                                              args.max_samples,
-                                              margin_pixels=args.margin_pixels)
-                percent = estimate.bottom_percent
-            else:
-                percent = args.bottom_percent
-            target = args.output / (source.stem + "_" + args.mode + ".mp4")
-            if source.resolve() == target.resolve():
-                raise ValueError("Output would replace input: " + str(source))
-            if target.exists() and not args.overwrite:
-                raise ValueError("Output already exists (use --overwrite): " + str(target))
-            temporary = target.with_name("." + target.stem + ".partial.mp4")
-            print("{}: {} bottom {:.1f}% -> {}".format(source.name, args.mode,
-                                                       percent, target), flush=True)
             try:
-                command = make_command(ffmpeg, source, temporary, args.mode,
-                                       percent, args.crf, args.preset)
-                subprocess.run(command, check=True)
-                os.replace(str(temporary), str(target))
-                report = {
-                    "input": source.name,
-                    "output": target.name,
-                    "mode": args.mode,
-                    "bottom_percent": percent,
-                    "detection": estimate.as_dict() if estimate else "manual",
-                }
-                target.with_suffix(".json").write_text(
-                    json.dumps(report, indent=2) + "\n", encoding="utf-8"
-                )
-            finally:
-                temporary.unlink(missing_ok=True)
-    except subprocess.CalledProcessError as exc:
-        print("Error: FFmpeg failed with exit code {}".format(exc.returncode), file=sys.stderr)
-        return 1
+                process_video(source, args)
+            except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+                failed += 1
+                print("Error: {}: {}".format(source.name, exc), file=sys.stderr)
+        return 1 if failed else 0
     except (ValueError, OSError) as exc:
         print("Error: " + str(exc), file=sys.stderr)
         return 1
