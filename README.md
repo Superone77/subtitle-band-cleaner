@@ -1,18 +1,18 @@
 # Subtitle Band Cleaner
 
-先检测视频是否有**烧进画面、位于底部**的对白字幕，再批量裁剪或模糊。有字幕时，工具根据 OCR 自动估计字幕区域，保留音轨并输出 H.264 MP4；没有检出字幕时，只重命名原文件，不重新编码，也不生成一份处理后的视频。
+先检测视频是否有**烧进画面、位于底部**的对白字幕，再批量裁剪或模糊。有字幕时，工具根据 OCR 自动估计字幕区域，保留音轨并输出 H.264 MP4；没有检出字幕时，只在输出目录写一份 JSON 检测记录，不重新编码，也不生成处理后的视频。输入视频默认不会被重命名或改动。
 
 ## 检测与命名
 
-输入 `clip.mp4` 时，命名规则如下。**原视频会在输入目录中重命名，文件内容不变**；处理结果写入指定的输出目录。
+输入 `clip.mp4` 时，命名规则如下。**原视频默认保持原名和内容不变**，检测结果写入输出目录的 JSON 记录和成片文件名；加 `--rename-originals` 时，原视频会在输入目录中按检测结果重命名，文件内容不变。
 
-| 检测结果 / 操作 | 输入目录中的原视频 | 输出目录中的成片 |
-| --- | --- | --- |
-| 未检出字幕 | `clip_no_subtitle.mp4` | 不生成 |
-| 有字幕，裁剪 | `clip_with_subtitle.mp4` | `clip_subtitle_cropped.mp4` |
-| 有字幕，模糊 | `clip_with_subtitle.mp4` | `clip_subtitle_blurred.mp4` |
+| 检测结果 / 操作 | 输入目录中的原视频 | 加 `--rename-originals` 时 | 输出目录中的成片 |
+| --- | --- | --- | --- |
+| 未检出字幕 | 不改动 | `clip_no_subtitle.mp4` | 不生成 |
+| 有字幕，裁剪 | 不改动 | `clip_with_subtitle.mp4` | `clip_subtitle_cropped.mp4` |
+| 有字幕，模糊 | 不改动 | `clip_with_subtitle.mp4` | `clip_subtitle_blurred.mp4` |
 
-原视频保留原扩展名。已有 `_no_subtitle` 或 `_with_subtitle` 后缀不会重复添加；批处理会跳过 `_subtitle_blurred` 和 `_subtitle_cropped` 成片。若重命名将覆盖另一个原视频，工具会报错并保留两个原文件。单个视频解码或处理失败时会继续检查同批次的其他视频，并以非零状态退出。
+成片和 JSON 记录的文件名会去掉输入已有的 `_no_subtitle` 或 `_with_subtitle` 后缀，例如 `clip_with_subtitle.mp4` 仍输出 `clip_subtitle_cropped.mp4`；批处理会跳过 `_subtitle_blurred` 和 `_subtitle_cropped` 成片。使用 `--rename-originals` 时，原视频保留原扩展名，已有后缀不会重复添加；若重命名将覆盖另一个原视频，工具会报错并保留两个原文件。单个视频解码或处理失败时会继续检查同批次的其他视频，并以非零状态退出。
 
 ## 单帧效果对比
 
@@ -46,10 +46,16 @@ python3 -m venv .venv
 .venv/bin/python clean_subtitles.py videos outputs --mode blur
 ```
 
-只检测并重命名所有原视频，不生成裁剪或模糊成片：
+只检测并为每个视频写 JSON 检测记录，不生成裁剪或模糊成片，也不改动原视频：
 
 ```bash
 .venv/bin/python clean_subtitles.py videos outputs --classify-only
+```
+
+同时按检测结果重命名所有原视频：
+
+```bash
+.venv/bin/python clean_subtitles.py videos outputs --classify-only --rename-originals
 ```
 
 已检出字幕时，可手动指定底部高度；这个参数本身不会让无字幕视频进入处理分支：
@@ -58,7 +64,7 @@ python3 -m venv .venv
 .venv/bin/python clean_subtitles.py input.mp4 outputs --mode crop --bottom-percent 15
 ```
 
-每个视频在输出目录都有一份 JSON 检测记录，包括新原文件名、是否检出字幕、是否处理、候选文字帧数和字幕区域。无字幕的视频对应 `clip_no_subtitle.json`。默认每秒抽一帧，最多 600 帧；可通过 `--sample-interval` 和 `--max-samples` 调整。`--margin-pixels` 增大字幕上方的安全边距。默认不覆盖已有成片；再次处理时加 `--overwrite`。
+每个视频在输出目录都有一份 JSON 检测记录，包括分类结果、原视频路径（重命名时为新文件名）、是否检出字幕、是否处理、候选文字帧数和字幕区域。无字幕的视频对应 `clip_no_subtitle.json`。默认每秒抽一帧，最多 600 帧；可通过 `--sample-interval` 和 `--max-samples` 调整。`--margin-pixels` 增大字幕上方的安全边距。默认不覆盖已有成片；再次处理时加 `--overwrite`。
 
 默认要求同一字幕位置至少出现 3 种不同文字，以减少把台标、固定人物介绍和场景标牌误判为对白字幕。仅有一两句字幕的短视频可降低阈值；非居中字幕可扩大检测范围：
 
@@ -84,9 +90,9 @@ OCR 只把画面下方、默认居中的文本视为字幕候选，检查其底�
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖无字幕不调用编码器、重命名前后内容哈希一致、两种处理后缀、重复运行、原文件名冲突、解码失败和批处理继续执行，以及固定文字与变化字幕的区分。
+测试覆盖无字幕不调用编码器、默认保持原视频文件名和内容不变、`--rename-originals` 重命名前后内容哈希一致、两种处理后缀、重复运行、原文件名冲突、解码失败和批处理继续执行，以及固定文字与变化字幕的区分。
 
-2026-10-21 本地样本验证使用默认参数：约每秒抽一帧、每视频最多 600 帧、同一位置至少 3 种不同字幕。新增文件夹按 6 个不同文件名取样（共 9 个文件条目），并与此前 5 段有字幕视频一起测试。
+2026-10-21 本地样本验证使用默认参数：约每秒抽一帧、每视频最多 600 帧、同一位置至少 3 种不同字幕。新增文件夹按 6 个不同文件名取样（共 9 个文件条目），并与此前 5 段有字幕视频一起测试。当时工具默认重命名原视频，相当于现在加 `--rename-originals`。
 
 | 样本组 | 数量 | 检测结果 | 原视频改名后 SHA-256 | 生成成片 |
 | --- | ---: | --- | --- | --- |

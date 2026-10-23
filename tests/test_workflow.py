@@ -36,11 +36,55 @@ class WorkflowTests(unittest.TestCase):
 
     @patch.object(cli, 'detect_bottom_band', return_value=estimate(False))
     @patch.object(cli.subprocess, 'run')
-    def test_negative_renames_without_encoder_even_with_manual_band(self, run, detect):
+    def test_negative_default_writes_only_report_and_keeps_input(self, run, detect):
         source = self.source()
         before = digest(source)
         result = cli.main([str(source), str(self.output), '--bottom-percent', '20',
                            '--ffmpeg', '/not-installed'])
+        self.assertEqual(result, 0)
+        self.assertEqual(list(self.inputs.iterdir()), [source])
+        self.assertEqual(digest(source), before)
+        self.assertEqual(list(self.output.iterdir()), [self.output / 'clip_no_subtitle.json'])
+        run.assert_not_called()
+        report = json.loads((self.output / 'clip_no_subtitle.json').read_text())
+        self.assertEqual(report['classification'], 'no_subtitle')
+        self.assertEqual(report['classified_input'], str(source))
+        self.assertFalse(report['renamed'])
+        self.assertFalse(report['processed'])
+
+    @patch.object(cli, 'detect_bottom_band', return_value=estimate(True))
+    @patch.object(cli, 'ffmpeg_executable', return_value='ffmpeg')
+    def test_positive_default_keeps_input_name_and_bytes(self, ffmpeg, detect):
+        source = self.source()
+        before = digest(source)
+        def encode(command, **kwargs):
+            Path(command[-1]).write_bytes(b'encoded output')
+        with patch.object(cli.subprocess, 'run', side_effect=encode):
+            self.assertEqual(cli.main([str(source), str(self.output)]), 0)
+        self.assertTrue((self.output / 'clip_subtitle_cropped.mp4').exists())
+        self.assertEqual(list(self.inputs.iterdir()), [source])
+        self.assertEqual(digest(source), before)
+        report = json.loads((self.output / 'clip_subtitle_cropped.json').read_text())
+        self.assertEqual(report['classification'], 'with_subtitle')
+        self.assertFalse(report['renamed'])
+
+    @patch.object(cli, 'detect_bottom_band', return_value=estimate(False))
+    @patch.object(cli.subprocess, 'run')
+    def test_default_ignores_tagged_sibling_original(self, run, detect):
+        tagged = self.source('clip_no_subtitle.mp4')
+        source = self.source()
+        before = digest(tagged), digest(source)
+        self.assertEqual(cli.main([str(source), str(self.output)]), 0)
+        self.assertEqual((digest(tagged), digest(source)), before)
+        run.assert_not_called()
+
+    @patch.object(cli, 'detect_bottom_band', return_value=estimate(False))
+    @patch.object(cli.subprocess, 'run')
+    def test_negative_renames_without_encoder_even_with_manual_band(self, run, detect):
+        source = self.source()
+        before = digest(source)
+        result = cli.main([str(source), str(self.output), '--bottom-percent', '20',
+                           '--ffmpeg', '/not-installed', '--rename-originals'])
         self.assertEqual(result, 0)
         self.assertEqual(digest(self.inputs / 'clip_no_subtitle.mp4'), before)
         self.assertFalse(source.exists())
@@ -49,15 +93,18 @@ class WorkflowTests(unittest.TestCase):
         report = json.loads((self.output / 'clip_no_subtitle.json').read_text())
         self.assertFalse(report['processed'])
         self.assertFalse(report['has_subtitles'])
+        self.assertTrue(report['renamed'])
+        self.assertEqual(report['classified_input'], str(self.inputs / 'clip_no_subtitle.mp4'))
 
     @patch.object(cli, 'detect_bottom_band', return_value=estimate(False))
     def test_tagging_is_idempotent_and_original_collision_is_preserved(self, detect):
         source = self.source('clip_no_subtitle.mp4')
         before = digest(source)
-        self.assertEqual(cli.main([str(source), str(self.output)]), 0)
+        self.assertEqual(cli.main([str(source), str(self.output), '--rename-originals']), 0)
         self.assertEqual(digest(source), before)
         untagged = self.source()
-        self.assertEqual(cli.main([str(untagged), str(self.output), '--overwrite']), 1)
+        self.assertEqual(cli.main([str(untagged), str(self.output), '--overwrite',
+                                   '--rename-originals']), 1)
         self.assertTrue(untagged.exists())
         self.assertEqual(digest(source), before)
 
@@ -77,10 +124,22 @@ class WorkflowTests(unittest.TestCase):
 
     @patch.object(cli, 'detect_bottom_band', return_value=estimate(True))
     @patch.object(cli.subprocess, 'run')
-    def test_classify_only_keeps_original_bytes(self, run, detect):
+    def test_classify_only_default_does_not_rename(self, run, detect):
         source = self.source()
         before = digest(source)
         self.assertEqual(cli.main([str(source), str(self.output), '--classify-only']), 0)
+        self.assertEqual(list(self.inputs.iterdir()), [source])
+        self.assertEqual(digest(source), before)
+        self.assertEqual(list(self.output.iterdir()), [self.output / 'clip_with_subtitle.json'])
+        run.assert_not_called()
+
+    @patch.object(cli, 'detect_bottom_band', return_value=estimate(True))
+    @patch.object(cli.subprocess, 'run')
+    def test_classify_only_keeps_original_bytes(self, run, detect):
+        source = self.source()
+        before = digest(source)
+        self.assertEqual(cli.main([str(source), str(self.output), '--classify-only',
+                                   '--rename-originals']), 0)
         self.assertEqual(digest(self.inputs / 'clip_with_subtitle.mp4'), before)
         run.assert_not_called()
 
@@ -89,7 +148,7 @@ class WorkflowTests(unittest.TestCase):
     def test_failed_encoding_leaves_original_name_and_no_partial_output(self, ffmpeg, detect):
         source = self.source()
         with patch.object(cli.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, ['ffmpeg'])):
-            self.assertEqual(cli.main([str(source), str(self.output)]), 1)
+            self.assertEqual(cli.main([str(source), str(self.output), '--rename-originals']), 1)
         self.assertTrue(source.exists())
         self.assertEqual(list(self.output.iterdir()), [])
 
@@ -101,7 +160,7 @@ class WorkflowTests(unittest.TestCase):
                 raise ValueError('Cannot decode video')
             return estimate(False)
         with patch.object(cli, 'detect_bottom_band', side_effect=detect):
-            self.assertEqual(cli.main([str(self.inputs), str(self.output)]), 1)
+            self.assertEqual(cli.main([str(self.inputs), str(self.output), '--rename-originals']), 1)
         self.assertTrue(bad.exists())
         self.assertTrue((self.inputs / 'z_good_no_subtitle.mp4').exists())
         self.assertFalse((self.inputs / 'a_bad_no_subtitle.mp4').exists())

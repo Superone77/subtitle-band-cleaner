@@ -88,8 +88,9 @@ def process_video(source, args):
     tag = "with_subtitle" if has_subtitles else "no_subtitle"
     stem = base_stem(source)
     classified = source.with_name(stem + "_" + tag + source.suffix)
-    if source != classified and classified.exists():
-        raise ValueError("Will not overwrite another original: " + str(classified))
+    original = classified if args.rename_originals else source
+    if original != source and original.exists():
+        raise ValueError("Will not overwrite another original: " + str(original))
     percent = args.bottom_percent if args.bottom_percent is not None else estimate.bottom_percent
     target = None
     if has_subtitles and not args.classify_only:
@@ -106,17 +107,21 @@ def process_video(source, args):
         try:
             subprocess.run(make_command(ffmpeg, source, temporary, args.mode,
                                         percent, args.crf, args.preset), check=True)
-            rename_original(source, classified)
+            rename_original(source, original)
             os.replace(str(temporary), str(target))
         finally:
             temporary.unlink(missing_ok=True)
-    else:
-        rename_original(source, classified)
+    elif args.rename_originals:
+        rename_original(source, original)
         print("{}: {} -> {} (video bytes unchanged)".format(
-            source.name, tag, classified), flush=True)
+            source.name, tag, original), flush=True)
+    else:
+        print("{}: {} (input unchanged)".format(source.name, tag), flush=True)
     report = {
         "input": source.name,
-        "classified_input": str(classified),
+        "classified_input": str(original),
+        "classification": tag,
+        "renamed": original != source,
         "has_subtitles": has_subtitles,
         "processed": target is not None,
         "forced": args.force_process,
@@ -164,7 +169,9 @@ def main(argv=None):
     parser.add_argument("--bottom-percent", type=percentage,
                         help="override band height after detection; does not force processing")
     parser.add_argument("--classify-only", action="store_true",
-                        help="detect and rename originals without encoding outputs")
+                        help="detect and write reports without encoding outputs")
+    parser.add_argument("--rename-originals", action="store_true",
+                        help="rename inputs to *_with_subtitle / *_no_subtitle")
     parser.add_argument("--force-process", action="store_true",
                         help="process even without OCR evidence; requires --bottom-percent")
     parser.add_argument("--min-distinct-captions", type=int, default=3,
