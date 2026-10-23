@@ -152,6 +152,56 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(source.exists())
         self.assertEqual(list(self.output.iterdir()), [])
 
+    @patch.object(cli, 'detect_bottom_band', return_value=estimate(True))
+    @patch.object(cli, 'ffmpeg_executable', return_value='ffmpeg')
+    def test_mask_mode_writes_masked_output_and_report(self, ffmpeg, detect):
+        source = self.source()
+        before = digest(source)
+        stats = {'fill': 'inpaint', 'sample_fps': 5.0, 'hold_samples': 3, 'samples': 50,
+                 'samples_with_captions': 10, 'frames': 300, 'masked_frames': 60}
+        def mask(video, destination, *args, **kwargs):
+            Path(destination).write_bytes(b'masked output')
+            return stats
+        with patch.object(cli, 'mask_video', side_effect=mask) as masked, \
+                patch.object(cli.subprocess, 'run') as run:
+            self.assertEqual(cli.main([str(source), str(self.output), '--mode', 'mask',
+                                       '--mask-fill', 'inpaint']), 0)
+        run.assert_not_called()
+        called = masked.call_args.args
+        self.assertEqual(called[0], source)
+        self.assertEqual(called[5], 300)
+        self.assertEqual(called[7:11], (5.0, 3, 8, 'inpaint'))
+        self.assertEqual(list(self.inputs.iterdir()), [source])
+        self.assertEqual(digest(source), before)
+        self.assertTrue((self.output / 'clip_subtitle_masked.mp4').exists())
+        self.assertEqual(list(self.output.glob('.*')), [])
+        report = json.loads((self.output / 'clip_subtitle_masked.json').read_text())
+        self.assertEqual(report['mode'], 'mask')
+        self.assertEqual(report['mask'], stats)
+
+    @patch.object(cli, 'detect_bottom_band', return_value=estimate(False))
+    @patch.object(cli, 'mask_video')
+    def test_mask_mode_does_not_run_without_subtitles(self, mask, detect):
+        source = self.source()
+        self.assertEqual(cli.main([str(source), str(self.output), '--mode', 'mask']), 0)
+        mask.assert_not_called()
+        self.assertEqual(cli.main([str(source), str(self.output), '--mode', 'mask',
+                                   '--mask-fps', '0']), 1)
+
+    @patch.object(cli, 'detect_bottom_band', return_value=estimate(False))
+    @patch.object(cli.subprocess, 'run')
+    def test_default_reports_of_distinct_inputs_do_not_overwrite_each_other(self, run, detect):
+        source = self.source()
+        tagged = self.source('clip_no_subtitle.mp4')
+        self.assertEqual(cli.main([str(self.inputs), str(self.output)]), 1)
+        report = json.loads((self.output / 'clip_no_subtitle.json').read_text())
+        self.assertEqual(report['input'], 'clip.mp4')
+        self.assertEqual(cli.main([str(source), str(self.output)]), 0)
+        self.assertEqual(cli.main([str(tagged), str(self.output), '--overwrite']), 0)
+        self.assertEqual(json.loads((self.output / 'clip_no_subtitle.json').read_text())['input'],
+                         'clip_no_subtitle.mp4')
+        self.assertTrue(source.exists() and tagged.exists())
+
     def test_decode_error_is_not_no_subtitle_and_batch_continues(self):
         bad = self.source('a_bad.mp4')
         self.source('z_good.mp4')
@@ -169,6 +219,7 @@ class WorkflowTests(unittest.TestCase):
         source = self.source()
         self.source('clip_subtitle_cropped.mp4')
         self.source('clip_subtitle_blurred.mp4')
+        self.source('clip_subtitle_masked.mp4')
         self.assertEqual(cli.inputs_at(self.inputs), [source])
 
 

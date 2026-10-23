@@ -11,9 +11,11 @@ import tempfile
 from pathlib import Path
 
 from subtitle_detection import detect_bottom_band
+from subtitle_masking import FILLS, mask_video
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv"}
+OUTPUT_SUFFIXES = {"crop": "subtitle_cropped", "blur": "subtitle_blurred", "mask": "subtitle_masked"}
 
 
 def percentage(value):
@@ -60,7 +62,7 @@ def inputs_at(path):
 
 
 def is_processed(path):
-    return path.stem.endswith(("_subtitle_blurred", "_subtitle_cropped"))
+    return path.stem.endswith(tuple("_" + suffix for suffix in OUTPUT_SUFFIXES.values()))
 
 
 def base_stem(path):
@@ -78,6 +80,15 @@ def rename_original(source, classified):
     source.rename(classified)
 
 
+def report_for_other_input(report_path, original):
+    """clip.mp4 and clip_no_subtitle.mp4 share a report name; keep the first one."""
+    try:
+        previous = json.loads(report_path.read_text(encoding="utf-8")).get("classified_input")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return bool(previous) and Path(previous).name != original.name
+
+
 def process_video(source, args):
     estimate = detect_bottom_band(
         source, args.sample_interval, args.max_samples,
@@ -93,9 +104,9 @@ def process_video(source, args):
         raise ValueError("Will not overwrite another original: " + str(original))
     percent = args.bottom_percent if args.bottom_percent is not None else estimate.bottom_percent
     target = None
+    mask = None
     if has_subtitles and not args.classify_only:
-        suffix = "subtitle_cropped" if args.mode == "crop" else "subtitle_blurred"
-        target = args.output / (stem + "_" + suffix + ".mp4")
+        target = args.output / (stem + "_" + OUTPUT_SUFFIXES[args.mode] + ".mp4")
         if target.exists() and not args.overwrite:
             raise ValueError("Output already exists (use --overwrite): " + str(target))
         ffmpeg = ffmpeg_executable(args.ffmpeg)
@@ -105,8 +116,17 @@ def process_video(source, args):
         print("{}: subtitles detected; {} bottom {:.1f}% -> {}".format(
             source.name, args.mode, percent, target), flush=True)
         try:
-            subprocess.run(make_command(ffmpeg, source, temporary, args.mode,
-                                        percent, args.crf, args.preset), check=True)
+            if args.mode == "mask":
+                band_top = estimate.height - round(estimate.height * percent / 100)
+                mask = mask_video(
+                    source, temporary, ffmpeg, args.crf, args.preset, band_top,
+                    estimate.caption_tracks, args.mask_fps, args.mask_hold,
+                    args.margin_pixels, args.mask_fill,
+                    min_distinct_captions=args.min_distinct_captions,
+                    alignment=args.alignment)
+            else:
+                subprocess.run(make_command(ffmpeg, source, temporary, args.mode,
+                                            percent, args.crf, args.preset), check=True)
             rename_original(source, original)
             os.replace(str(temporary), str(target))
         finally:
@@ -130,7 +150,11 @@ def process_video(source, args):
         "bottom_percent": percent if has_subtitles else None,
         "detection": estimate.as_dict(),
     }
+    if mask is not None:
+        report["mask"] = mask
     report_path = target.with_suffix(".json") if target else args.output / (stem + "_" + tag + ".json")
+    if report_path.exists() and not args.overwrite and report_for_other_input(report_path, original):
+        raise ValueError("Report already exists for another input (use --overwrite): " + str(report_path))
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
@@ -165,7 +189,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, help="one video or a directory of videos")
     parser.add_argument("output", type=Path, help="output directory")
-    parser.add_argument("--mode", choices=("crop", "blur"), default="crop")
+    parser.add_argument("--mode", choices=tuple(OUTPUT_SUFFIXES), default="crop",
+                        help="crop or blur the whole band, or mask caption boxes per frame")
+    parser.add_argument("--mask-fps", type=float, default=5.0,
+                        help="mask mode: OCR samples per second on the band (default: 5)")
+    parser.add_argument("--mask-fill", choices=FILLS, default="blur",
+                        help="mask mode: how to fill caption boxes (default: blur)")
+    parser.add_argument("--mask-hold", type=int, default=3,
+                        help="mask mode: keep boxes for this many samples after text vanishes (default: 3)")
     parser.add_argument("--bottom-percent", type=percentage,
                         help="override band height after detection; does not force processing")
     parser.add_argument("--classify-only", action="store_true",
@@ -199,6 +230,8 @@ def main(argv=None):
             raise ValueError("Sample interval and max samples must be positive; margin cannot be negative")
         if args.min_distinct_captions < 1:
             raise ValueError("Minimum distinct captions must be positive")
+        if args.mask_fps <= 0 or args.mask_hold < 0:
+            raise ValueError("Mask sample rate must be positive; mask hold cannot be negative")
         if args.force_process and args.bottom_percent is None:
             raise ValueError("--force-process requires --bottom-percent")
         sources = inputs_at(args.input)
