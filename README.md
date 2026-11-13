@@ -1,165 +1,173 @@
 # Subtitle Band Cleaner
 
-先检测视频是否有**烧进画面、位于底部**的对白字幕，再批量裁剪、模糊或逐帧遮盖。有字幕时，工具根据 OCR 自动估计字幕区域，保留音轨并输出 H.264 MP4；没有检出字幕时，只在输出目录写一份 JSON 检测记录，不重新编码，也不生成处理后的视频。输入视频默认不会被重命名或改动。
+Detect **burned-in dialogue subtitles near the bottom of a video**, then crop, blur, or mask them in batches. The tool uses OCR to locate subtitles, copies the source audio, and exports H.264 MP4. If it detects no subtitles, it writes a JSON report without encoding a new video. Input files keep their original names and contents by default.
 
-## 检测与命名
+## Detection and file naming
 
-输入 `clip.mp4` 时，命名规则如下。**原视频默认保持原名和内容不变**，检测结果写入输出目录的 JSON 记录和成片文件名；加 `--rename-originals` 时，原视频会在输入目录中按检测结果重命名，文件内容不变。
+For an input named `clip.mp4`, the tool writes the classification to a JSON report and uses it to name any output video. Pass `--rename-originals` to rename inputs in place without changing their contents.
 
-| 检测结果 / 操作 | 输入目录中的原视频 | 加 `--rename-originals` 时 | 输出目录中的成片 |
+| Detection result or operation | Input name by default | Input name with `--rename-originals` | Output video |
 | --- | --- | --- | --- |
-| 未检出字幕 | 不改动 | `clip_no_subtitle.mp4` | 不生成 |
-| 有字幕，裁剪 | 不改动 | `clip_with_subtitle.mp4` | `clip_subtitle_cropped.mp4` |
-| 有字幕，模糊 | 不改动 | `clip_with_subtitle.mp4` | `clip_subtitle_blurred.mp4` |
-| 有字幕，遮盖 | 不改动 | `clip_with_subtitle.mp4` | `clip_subtitle_masked.mp4` |
+| No subtitles detected | Unchanged | `clip_no_subtitle.mp4` | None |
+| Subtitles detected, crop | Unchanged | `clip_with_subtitle.mp4` | `clip_subtitle_cropped.mp4` |
+| Subtitles detected, blur | Unchanged | `clip_with_subtitle.mp4` | `clip_subtitle_blurred.mp4` |
+| Subtitles detected, mask | Unchanged | `clip_with_subtitle.mp4` | `clip_subtitle_masked.mp4` |
 
-成片和 JSON 记录的文件名会去掉输入已有的 `_no_subtitle` 或 `_with_subtitle` 后缀，例如 `clip_with_subtitle.mp4` 仍输出 `clip_subtitle_cropped.mp4`；批处理会跳过 `_subtitle_cropped`、`_subtitle_blurred` 和 `_subtitle_masked` 成片。使用 `--rename-originals` 时，原视频保留原扩展名，已有后缀不会重复添加；若重命名将覆盖另一个原视频，工具会报错并保留两个原文件。单个视频解码或处理失败时会继续检查同批次的其他视频，并以非零状态退出。
+Output videos and reports omit any existing `_no_subtitle` or `_with_subtitle` suffix from the input name. For example, `clip_with_subtitle.mp4` still produces `clip_subtitle_cropped.mp4`. Batch processing skips files already ending in `_subtitle_cropped`, `_subtitle_blurred`, or `_subtitle_masked`. When renaming an original, the tool keeps its extension, avoids duplicate suffixes, and reports a naming conflict without replacing either file. If a video fails to decode or process, the batch continues with the other videos and exits with a nonzero status.
 
-## 单帧效果对比
+## Frame comparison
 
-以下是同一段视频在 **9.5 秒**处的原始帧与实际处理结果。工具自动检测到需处理底部 **13.3%**：裁剪模式移除该区域，模糊模式保留原始尺寸并遮挡字幕。图片按相同宽度展示，保留各自的高宽比。
+The images show the same frame at **9.5 seconds** before and after processing. The tool detected a band covering the bottom **13.3%** of the frame. Crop removes that band; blur obscures the subtitle while keeping the full frame. All images are shown at the same width and retain their aspect ratios.
 
-| 原始帧 | 自动裁剪 | 自动模糊 |
+| Original | Automatic crop | Automatic blur |
 | --- | --- | --- |
-| <img src="docs/images/frame-original.png" width="300" alt="原始帧：底部有 What? 字幕"> | <img src="docs/images/frame-crop.png" width="300" alt="裁剪结果：移除底部字幕区域"> | <img src="docs/images/frame-blur.png" width="300" alt="模糊结果：保留画面尺寸，字幕不可读"> |
+| <img src="docs/images/frame-original.png" width="300" alt="Original frame with the subtitle What? at the bottom"> | <img src="docs/images/frame-crop.png" width="300" alt="Cropped frame with the bottom subtitle band removed"> | <img src="docs/images/frame-blur.png" width="300" alt="Full frame with the subtitle blurred beyond readability"> |
 | 626 × 360 | 626 × 312 | 626 × 360 |
 
-## 逐帧遮盖（mask 模式）
+## Mask mode: edit only the subtitle boxes
 
-`crop` 和 `blur` 对整段视频处理一条固定高度的底部横带。当这条横带里有观众需要看到的内容，例如桌上的手和器物，就会连同字幕一起丢掉。`--mode mask` 只处理 OCR 找到的字幕文字框：每帧只遮盖字幕所在的矩形，没有字幕框的帧直接进入编码，横带其余部分不做遮盖。字幕框会按 `--margin-pixels` 向四周外扩，填充方式由 `--mask-fill` 决定：`blur`（默认，只对文字框做高斯模糊）、`pixelate`（马赛克）或 `inpaint`（`cv2.inpaint` Telea 修补，视觉上最干净）。
+`crop` and `blur` operate on a fixed bottom band throughout the video. That band may contain useful details, such as hands or objects on a table. `--mode mask` edits only the rectangles around detected subtitles. Frames without active boxes go straight to the encoder without masking. `--margin-pixels` expands each rectangle on all sides. Choose a fill with `--mask-fill`: `blur` (default, Gaussian blur), `pixelate` (mosaic), or `inpaint` (OpenCV's Telea method via `cv2.inpaint`).
 
-检测步骤和 `crop`、`blur` 相同，仍由 `detect_bottom_band` 判断有无字幕并给出横带和字幕轨道位置；只有检出字幕（或 `--force-process --bottom-percent`）才进入遮盖。遮盖分两遍：第一遍只对横带裁剪区域做 OCR，默认每秒 5 个样本（`--mask-fps`），只保留与已接受的字幕轨道基线和水平位置一致、且随时间变化的文字框，固定文字沿用检测阶段的轨道逻辑剔除；两个样本之间的帧沿用上一个样本的框并合并下一个样本的框，文字消失后再保留 `--mask-hold`（默认 3）个样本，避免遮盖闪烁。第二遍逐帧解码和填充，通过 PyAV 按原始显示时间戳编码，音频包直接从源文件复制。
+Mask mode uses the same `detect_bottom_band` step as crop and blur. It runs when subtitles are detected or when you pass `--force-process --bottom-percent`. In the first pass, OCR samples only the bottom band, at 5 samples per second by default (`--mask-fps`). The tool keeps changing text boxes that match a detected subtitle track's baseline and horizontal position, and filters out static text. Between sampled frames, it combines boxes from adjacent samples. It can keep a box for another `--mask-hold` samples after the text disappears (default: 3) to reduce flicker. In the second pass, PyAV decodes, masks, and encodes each frame using its original presentation timestamp, while copying audio packets from the source.
 
-计算量：RapidOCR 默认把短边不足 736 像素的图放大后再检测，对窄长的横带裁剪反而比整帧更慢；遮盖模式单独使用一个把长边限制在 960 像素的检测器实例，检测阶段的引擎和结果不变。在本机 CPU 上，854 × 480、30 fps、70 秒的片段，每个横带样本约 30 ms，全片 350 个样本的 OCR 约 10 秒，整个遮盖流程约 34 秒；逐帧整帧 OCR 则需要约 5 分钟。
+RapidOCR normally scales up images with a short side below 736 pixels, which can make OCR on a narrow band slower than OCR on a full frame. Mask mode uses a separate detector that limits the long side to 960 pixels. The initial subtitle detection step uses the same detector as before. In a local CPU test of a 70-second clip at 854 × 480 and 30 fps, each band sample took about 30 ms. OCR took about 10 seconds for 350 samples, and the full masking run took about 34 seconds. Running OCR on every full frame would take about 5 minutes at the measured rate.
 
-以下是另一段视频（854 × 480，OmniTalk 片段 R8-15，36 秒处）的对比，不是上表那段视频；横带模糊按工具自动检出的底部 12.5% 处理。横带模糊把碗和双手一起糊掉，逐帧遮盖只盖住字幕：
+Here is a different clip, OmniTalk R8-15 (854 × 480), at 36 seconds. Full-band blur affects the bottom 12.5% of the frame, including the bowl and hands. Mask mode targets the subtitle boxes.
 
-| 原始帧 | 整条横带模糊 | 逐帧遮盖（blur） | 逐帧遮盖（inpaint） |
+| Original | Full-band blur | Mask with blur | Mask with inpainting |
 | --- | --- | --- | --- |
-| <img src="docs/images/frame-mask-original.png" width="220" alt="原始帧：底部有英文字幕，桌上有碗和双手"> | <img src="docs/images/frame-mask-band.png" width="220" alt="横带模糊：字幕和碗、双手一起被模糊"> | <img src="docs/images/frame-mask.png" width="220" alt="逐帧遮盖：只有字幕矩形被模糊"> | <img src="docs/images/frame-mask-inpaint.png" width="220" alt="逐帧遮盖修补：字幕矩形被修补填充"> |
+| <img src="docs/images/frame-mask-original.png" width="220" alt="Original frame with English subtitles, a bowl, and hands at the table"> | <img src="docs/images/frame-mask-band.png" width="220" alt="Full-band blur obscures the subtitles, bowl, and hands"> | <img src="docs/images/frame-mask.png" width="220" alt="Blur applied only to a rectangle around the subtitle"> | <img src="docs/images/frame-mask-inpaint.png" width="220" alt="Inpainting applied only to a rectangle around the subtitle"> |
 
-## 安装
+## Installation
 
-需要 Python 3.10+。系统没有 `ffmpeg` 时，`imageio-ffmpeg` 会提供可执行文件；使用系统 FFmpeg 时需支持 `-fps_mode passthrough` 和 `-enc_time_base:v filter`（建议 7.1+）。OCR 使用 [RapidOCR](https://rapidai.github.io/RapidOCRDocs/main/en/install_usage/rapidocr/install/) 和 ONNX Runtime，模型随 Python 包安装。
+Requires Python 3.10 or later. If FFmpeg is not on your PATH, `imageio-ffmpeg` provides an executable. A system FFmpeg must support `-fps_mode passthrough` and `-enc_time_base:v filter` (version 7.1 or later is recommended). OCR uses [RapidOCR](https://rapidai.github.io/RapidOCRDocs/main/en/install_usage/rapidocr/install/) and ONNX Runtime. The OCR models come with the Python package.
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-## 使用
+## Usage
 
-自动检测并处理一个视频：
+Detect subtitles and crop one video:
 
 ```bash
 .venv/bin/python clean_subtitles.py input.mp4 outputs --mode crop
 ```
 
-自动处理整个文件夹；`blur` 不裁掉任何画面：
+Process a directory with full-band blur, keeping the full composition:
 
 ```bash
 .venv/bin/python clean_subtitles.py videos outputs --mode blur
 ```
 
-只遮盖字幕文字框，保留横带里的其他画面；`--mask-fill inpaint` 用修补代替模糊：
+Mask only the subtitle boxes. In this example, inpainting fills the boxes instead of blurring them:
 
 ```bash
 .venv/bin/python clean_subtitles.py videos outputs --mode mask --mask-fill inpaint
 ```
 
-只检测并为每个视频写 JSON 检测记录，不生成裁剪或模糊成片，也不改动原视频：
+Detect and write a JSON report for each video without creating any new videos or modifying the originals:
 
 ```bash
 .venv/bin/python clean_subtitles.py videos outputs --classify-only
 ```
 
-同时按检测结果重命名所有原视频：
+Detect and rename originals according to the result:
 
 ```bash
 .venv/bin/python clean_subtitles.py videos outputs --classify-only --rename-originals
 ```
 
-已检出字幕时，可手动指定底部高度；这个参数本身不会让无字幕视频进入处理分支：
+Set the bottom band height manually as a percentage. This option alone does not process videos in which no subtitles were detected:
 
 ```bash
 .venv/bin/python clean_subtitles.py input.mp4 outputs --mode crop --bottom-percent 15
 ```
 
-每个视频在输出目录都有一份 JSON 检测记录，包括分类结果、原视频路径（重命名时为新文件名）、是否检出字幕、是否处理、候选文字帧数、字幕区域和字幕轨道位置；遮盖模式另记录填充方式、采样率、样本数和被遮盖的帧数。无字幕的视频对应 `clip_no_subtitle.json`。默认每秒抽一帧，最多 600 帧；可通过 `--sample-interval` 和 `--max-samples` 调整。`--margin-pixels` 增大字幕上方的安全边距，遮盖模式下也是文字框向四周外扩的像素数。默认不覆盖已有成片；再次处理时加 `--overwrite`。
+The JSON report records the classification, original file path (or new path if renamed), whether the video was processed, the number of text candidate frames, the subtitle band, and the subtitle track positions. Mask mode also reports its fill, sample rate, sample count, and number of masked frames. For a clip without detected subtitles, the report is named `clip_no_subtitle.json`.
 
-默认要求同一字幕位置至少出现 3 种不同文字，以减少把台标、固定人物介绍和场景标牌误判为对白字幕。仅有一两句字幕的短视频可降低阈值；非居中字幕可扩大检测范围：
+Initial detection samples about one frame per second, up to 600 frames per video. Use `--sample-interval` and `--max-samples` to change this. Use `--margin-pixels` to add space above the subtitle band or around each box in mask mode. Pass `--overwrite` to replace an existing output.
+
+The default detector looks for at least 3 distinct captions at the same position to help distinguish dialogue subtitles from logos, name captions, and signs. For short clips with only one or two captions, lower the threshold. For subtitles outside the center, expand the detection area:
 
 ```bash
 .venv/bin/python clean_subtitles.py input.mp4 outputs --min-distinct-captions 1 --alignment any
 ```
 
-如果已经人工确认有字幕，但 OCR 未检出，可明确强制处理并给出高度：
+If you have confirmed that subtitles are present but OCR misses them, force processing and specify the band height:
 
 ```bash
 .venv/bin/python clean_subtitles.py input.mp4 outputs --force-process --bottom-percent 15
 ```
 
-## 导出画质与音画对齐
+## Export quality and audio sync
 
-默认导出 H.264 MP4，使用 `--crf 16` 和 Lanczos 缩放。字幕处理完成后，画面高度超过 480 像素才等比缩到 480；低于 480 不放大。比如 360p 的 `blur` 和 `mask` 仍是 360p，`crop` 的高度会随裁剪减少。H.264 的 4:2:0 输出要求宽高为偶数，奇数尺寸最多减 1 像素；缩放时宽度取接近原比例的偶数。需要关闭高度上限时，加 `--max-height 0`。
+The default output is H.264 MP4 at `--crf 16` with Lanczos scaling. After subtitle processing, frames taller than 480 pixels are scaled proportionally to a height of 480 pixels. Smaller frames are never upscaled. For example, a 360p input stays at 360p with blur or mask, while crop produces a shorter frame. H.264 with 4:2:0 chroma subsampling requires even dimensions. Odd dimensions may lose one pixel, and downscaled widths are rounded to an even value close to the original aspect ratio. Pass `--max-height 0` to disable the height limit.
 
-涉及字幕编辑的输出会重新编码；未遮盖区域也不能保证与原视频逐像素一致，缩到 480p 会丢失原有的高频细节。三种模式均保留源视频的逐帧显示时间，直接复制 MP4 支持的源音轨。源视频已有的音画偏移也会保留。未检测到字幕时，仍只输出 JSON，不改变原视频尺寸或内容。
+Edited video is re-encoded, so pixels outside the masked region can change, and downscaling to 480p reduces fine detail. All three modes preserve the source frame timestamps and copy audio tracks that MP4 supports. Any audio and video offset already present in the source carries over. When no subtitles are detected, the tool writes only a JSON report and leaves the source resolution and content intact.
 
-## 原理与边界
+## How detection works and what it can miss
 
-OCR 只把画面下方、默认居中的文本视为字幕候选，检查其底线和水平位置是否稳定、文字是否随时间更换；微小 OCR 拼写差异会合并。多行字幕会一起纳入。最终使用低分位位置确定一条整段视频固定的裁剪线，因此字幕出现或消失时，处理区域仍然存在。`crop` 会改变画面高宽比并丢掉底部画面；`blur` 保留整幅构图，但被模糊的区域不能复原。`mask` 只改动字幕文字框，但依赖逐样本 OCR：某个样本漏检时，相邻样本的框和 `--mask-hold` 能补上短暂的遗漏，连续多个样本都漏检的短字幕仍可能有零点几秒未被遮盖；横带以外的文字不会被遮盖。
+OCR considers text near the bottom of the frame, centered by default. The detector checks for a consistent baseline and horizontal position, and for text that changes over time. It merges small OCR spelling variations and considers multiple lines together. Crop and blur use a fixed boundary derived from a low percentile of the detected subtitle positions, so the band is processed even when subtitles disappear. Crop removes the bottom part of the frame and changes the aspect ratio. Blur keeps the composition but obscures the band. Mask limits edits to subtitle boxes, but can miss brief captions if OCR fails across consecutive samples. Adjacent samples and `--mask-hold` help cover shorter gaps. Text outside the band is not masked.
 
-`no_subtitle` 表示抽样中未检出符合条件的底部对白字幕，并非逐帧证明完全没有文字。很稀疏、短暂、特殊样式或其他位置的字幕可能漏检；变化的节目横幅也可能被误认。仅有独立字幕轨的视频不在本工具的画面 OCR 检测范围内。进入处理分支时，独立字幕轨会从输出中移除；无字幕分支不会改动任何视频字节或轨道。
+`no_subtitle` means the sampled frames did not contain matching bottom dialogue subtitles. It does not rule out all on-screen text. Sparse, brief, unusually styled, or differently positioned subtitles may go undetected. Changing on-screen banners can be mistaken for subtitles. OCR does not detect separate subtitle tracks, which are omitted from newly encoded outputs. The source file and its tracks remain intact when no subtitles are detected.
 
-## 验证
+## Validation
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖命名、冲突、字幕轨道识别、遮盖框和导出。导出测试实际编码 360p、480p、720p 的可变帧率样片，检查三种模式的高度、源视频帧时间及音频包的时间戳和哈希。
+The suite covers file naming and conflicts, subtitle track detection, mask boxes, and export. The export tests encode variable frame rate clips at 360p, 480p, and 720p and check output height, video frame timestamps, and audio packet timestamps and hashes for all three modes.
 
-2026-11-13（Apple Silicon，FFmpeg 7.1、PyAV 19.0.2、CRF 16）用真实 360p 对白片段及其 720p 测试副本导出三种模式，并用有三组闪光和短音的可变帧率样片测音画同步。画质 PSNR 只比较未被编辑的画面上部 60%，参考帧做相同裁剪和缩放，但不再编码。
+### Export quality and timing
 
-| 输入 | 导出：裁剪 / 模糊 / 逐帧遮盖 | 画面上部亮度 PSNR | 相对源文件的音画变化 |
+On 2026-11-13, we exported a real 360p dialogue clip and a 720p test copy in all three modes (Apple Silicon, FFmpeg 7.1, PyAV 19.0.2, CRF 16). For audio sync, we also used a variable frame rate clip with three flash-and-beep pairs. Luma PSNR compares the top 60% of the output with reference frames cropped and scaled the same way without re-encoding.
+
+| Input | Output size: crop / blur / mask | Luma PSNR, top of frame | Audio and video timing |
 | --- | --- | --- | --- |
-| 对白 626 × 360 | 626 × 312 / 626 × 360 / 626 × 360 | 49.7–49.9 dB | 570 帧时间戳一致、音频包一致 |
-| 对白 1252 × 720（测试副本） | 950 × 480 / 834 × 480 / 834 × 480 | 48.8–49.2 dB | 570 帧时间戳一致、音频包一致 |
-| 可变帧率 1280 × 720 ＋ 366 ms 起始偏移 | 1004 × 480 / 854 × 480 / 854 × 480 | — | 165 帧时间戳一致、音频包一致；3 个闪光与短音的相对位置未变 |
+| Dialogue, 626 × 360 | 626 × 312 / 626 × 360 / 626 × 360 | 49.7–49.9 dB | All 570 frame timestamps and audio packets matched the source |
+| Dialogue test copy, 1252 × 720 | 950 × 480 / 834 × 480 / 834 × 480 | 48.8–49.2 dB | All 570 frame timestamps and audio packets matched the source |
+| Variable frame rate, 1280 × 720, with a 366 ms starting offset | 1004 × 480 / 854 × 480 / 854 × 480 | — | All 165 frame timestamps and audio packets matched; no added offset at any of the 3 sync points |
 
-逐帧遮盖在两个对白测试文件中均处理了 432/570 帧。以上是样片结果；PSNR 不包含主动处理的字幕区域，也不衡量 720p 缩到 480p 本身的细节损失。
+Mask mode edited 432 of 570 frames in each dialogue test. These results apply to the tested clips. PSNR excludes the edited subtitle region and does not measure detail lost by scaling from 720p to 480p.
 
-2026-10-21 本地样本验证使用默认参数：约每秒抽一帧、每视频最多 600 帧、同一位置至少 3 种不同字幕。新增文件夹按 6 个不同文件名取样（共 9 个文件条目），并与此前 5 段有字幕视频一起测试。当时工具默认重命名原视频，相当于现在加 `--rename-originals`。
+### Classification
 
-| 样本组 | 数量 | 检测结果 | 原视频改名后 SHA-256 | 生成成片 |
+On 2026-10-21, we used the default settings: roughly one sampled frame per second, up to 600 frames per video, with at least 3 distinct captions at the same position. The new sample folder had 9 entries across 6 distinct filenames; we tested one of each alongside 5 previously supplied videos with subtitles. At that time, renaming originals was the default, equivalent to passing `--rename-originals` now.
+
+| Sample group | Clips | Classification | SHA-256 unchanged after renaming | Output videos |
 | --- | ---: | --- | --- | --- |
-| 新增无对白字幕视频，含人物介绍、台标和场景文字 | 6 | 6 段均为 `no_subtitle` | 6/6 一致 | 0 |
-| 原有底部对白字幕视频 | 5 | 5 段均为 `with_subtitle` | 5/5 一致 | 5 个 `subtitle_cropped`，另对其中 1 段验证 `subtitle_blurred` |
+| No dialogue subtitles; some clips include name captions, logos, or scene text | 6 | All 6: `no_subtitle` | 6/6 | 0 |
+| Bottom dialogue subtitles | 5 | All 5: `with_subtitle` | 5/5 | 5 cropped outputs; blur also tested on 1 clip |
 
-结果只说明本批样本的行为符合预期，不代表所有字幕样式的识别准确率。
+These results describe the sample batch, not detection accuracy across all subtitle styles.
 
-2026-10-23（导出更新前）在上面对比图所用的 R8-15 片段（854 × 480，30 fps，70 秒）上验证遮盖模式，默认参数，`--preset medium`，本机 CPU。输入文件在所有运行后哈希不变；四种成片都是 70.000 秒、带原音轨。
+### Masking performance
 
-| 模式 | 耗时（含约 14 秒检测） | 被遮盖的帧 |
+On 2026-10-23, before the export update, we tested the R8-15 clip shown above (854 × 480, 30 fps, 70 seconds) on a local CPU with default settings and `--preset medium`. The source hash was unchanged across runs. All four output videos were 70.000 seconds long and kept the source audio track.
+
+| Mode | Time, including about 14 seconds of detection | Frames edited |
 | --- | ---: | ---: |
-| `crop` | 18.6 秒 | 全部 |
-| `blur` | 20.0 秒 | 全部 |
-| `mask --mask-fill blur` | 33.7 秒 | 666 / 2100 |
-| `mask --mask-fill inpaint` | 35.7 秒 | 666 / 2100 |
+| `crop` | 18.6 s | All |
+| `blur` | 20.0 s | All |
+| `mask --mask-fill blur` | 33.7 s | 666 / 2100 |
+| `mask --mask-fill inpaint` | 35.7 s | 666 / 2100 |
 
-"被遮盖的帧"是画面上有字幕、因而被改动的帧数；其余帧与直接重编码的结果逐像素相同。对三段遮盖成片隔帧做整帧 OCR 复查，未被改动的帧里读不出任何字幕。
+For mask mode, the frame count refers to frames where a subtitle mask was applied. Unmasked frames matched a plain re-encode pixel for pixel in that test. Full-frame OCR on every other frame of the three masked clips found no readable subtitles on unmasked frames.
 
-同日再用两段字幕样式不同的片段验证遮盖模式（默认参数，`--preset medium`；两种填充的遮盖帧数相同）。VOA Learning English 片段（640 × 360，25 fps，26 秒）是大号白色字幕，有时两行且第二行挂在单行字幕基线之下；Black Books 片段（640 × 360，25 fps，62 秒）是小号白色双行字幕，字幕下方是堆满书的桌面。每段都以整帧 OCR 逐隔帧复查遮盖成片：VOA 中 1 秒钟的短字幕 "Sorry." 因文字框高度超过检测阶段的 16% 上限而漏遮，遮盖阶段的上限放宽到 20% 后两段均无残留字幕；横带中没有字幕时画面原样保留。
+On the same day, we tested two more subtitle styles with the default settings and `--preset medium`. The VOA Learning English clip (640 × 360, 25 fps, 26 seconds) has large white subtitles, sometimes with a second line below the usual baseline. The Black Books clip (640 × 360, 25 fps, 62 seconds) has small white two-line subtitles over a desk full of books. Both fills masked the same number of frames. Full-frame OCR checked every other frame. A one-second subtitle, “Sorry.”, initially escaped masking in the VOA clip because its box was taller than the 16% detection limit. Once the masking pass allowed boxes up to 20% of frame height, the OCR check found no remaining readable subtitles in either clip. Areas of the bottom band without subtitle boxes were left unmasked.
 
-| 片段 | 检测 | `blur` | `mask` blur / inpaint | 被遮盖的帧 |
+| Clip | Detection | `blur` | Mask: blur / inpaint | Frames masked |
 | --- | --- | ---: | ---: | ---: |
-| VOA（26 秒） | 底部 27.8%，7 种字幕 | 6.4 秒 | 18.8 / 27.5 秒 | 615 / 650 |
-| Black Books（62 秒） | 底部 22.8%，14 种字幕 | 14.8 秒 | 30.8 / 36.8 秒 | 1004 / 1549 |
+| VOA (26 s) | Bottom 27.8%; 7 distinct captions | 6.4 s | 18.8 / 27.5 s | 615 / 650 |
+| Black Books (62 s) | Bottom 22.8%; 14 distinct captions | 14.8 s | 30.8 / 36.8 s | 1004 / 1549 |
 
-两段的三个字幕时刻对比（每行从左到右：原始帧、整条横带模糊、逐帧遮盖 blur、逐帧遮盖 inpaint）：
+Each row shows the same moment: original, full-band blur, mask with blur, and mask with inpainting.
 
-<img src="docs/images/validation-voa.jpg" width="900" alt="VOA 片段三个时刻的原始帧、横带模糊、逐帧遮盖 blur 与 inpaint 对比">
+<img src="docs/images/validation-voa.jpg" width="900" alt="VOA clip at three moments, comparing the original frame, full-band blur, mask with blur, and mask with inpainting">
 
-<img src="docs/images/validation-blackbooks.jpg" width="900" alt="Black Books 片段三个时刻的原始帧、横带模糊、逐帧遮盖 blur 与 inpaint 对比">
+<img src="docs/images/validation-blackbooks.jpg" width="900" alt="Black Books clip at three moments, comparing the original frame, full-band blur, mask with blur, and mask with inpainting">
 
-完整的原始视频和处理后视频不会提交到 Git 仓库；仓库仅包含上面的单帧对比图。
+The repository includes the comparison images. Full source and output videos are kept outside Git.
