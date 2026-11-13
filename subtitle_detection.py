@@ -1,6 +1,6 @@
 """Detect changing bottom captions and estimate their processing band."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 from math import ceil
 import re
@@ -20,6 +20,7 @@ class BandEstimate:
     candidate_frames: int = 0
     distinct_captions: int = 0
     reason: str = "changing_bottom_captions"
+    caption_tracks: list = field(default_factory=list)
 
     def as_dict(self):
         return asdict(self)
@@ -81,6 +82,8 @@ def detect_bottom_band(path, sample_interval=1.0, max_samples=600,
     Scene text and static nameplates are not sufficient subtitle evidence.
     Decode failures remain errors and never become no-subtitle decisions.
     """
+    from statistics import median
+
     import cv2
     import numpy as np
     from rapidocr import RapidOCR
@@ -162,7 +165,13 @@ def detect_bottom_band(path, sample_interval=1.0, max_samples=600,
         percent = 100 * (height - top) / height
         if percent >= 60:
             raise ValueError("Detected band is implausibly large for " + str(path))
+        caption_tracks = [{
+            "baseline": float(median(item.bottom for item in track)),
+            "center_x": float(median((item.left + item.right) / 2 for item in track)),
+            "captions": len(track),
+        } for track in tracks]
         return BandEstimate(width, height, duration, sampled, len(captions), top,
-                            percent, True, len(observations), distinct)
+                            percent, True, len(observations), distinct,
+                            caption_tracks=caption_tracks)
     finally:
         capture.release()
