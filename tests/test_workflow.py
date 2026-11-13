@@ -169,8 +169,9 @@ class WorkflowTests(unittest.TestCase):
         run.assert_not_called()
         called = masked.call_args.args
         self.assertEqual(called[0], source)
-        self.assertEqual(called[5], 300)
-        self.assertEqual(called[7:11], (5.0, 3, 8, 'inpaint'))
+        self.assertEqual(called[4], 300)
+        self.assertEqual(called[6:10], (5.0, 3, 8, 'inpaint'))
+        self.assertEqual(masked.call_args.kwargs['max_height'], 480)
         self.assertEqual(list(self.inputs.iterdir()), [source])
         self.assertEqual(digest(source), before)
         self.assertTrue((self.output / 'clip_subtitle_masked.mp4').exists())

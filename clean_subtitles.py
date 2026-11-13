@@ -12,6 +12,7 @@ from pathlib import Path
 
 from subtitle_detection import detect_bottom_band
 from subtitle_masking import FILLS, mask_video
+from video_export import DEFAULT_CRF, DEFAULT_MAX_HEIGHT, scale_filter
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv"}
@@ -109,7 +110,6 @@ def process_video(source, args):
         target = args.output / (stem + "_" + OUTPUT_SUFFIXES[args.mode] + ".mp4")
         if target.exists() and not args.overwrite:
             raise ValueError("Output already exists (use --overwrite): " + str(target))
-        ffmpeg = ffmpeg_executable(args.ffmpeg)
         with tempfile.NamedTemporaryFile(dir=args.output, prefix="." + stem + ".",
                                          suffix=".partial.mp4", delete=False) as file:
             temporary = Path(file.name)
@@ -117,16 +117,22 @@ def process_video(source, args):
             source.name, args.mode, percent, target), flush=True)
         try:
             if args.mode == "mask":
+                import av
+
                 band_top = estimate.height - round(estimate.height * percent / 100)
-                mask = mask_video(
-                    source, temporary, ffmpeg, args.crf, args.preset, band_top,
-                    estimate.caption_tracks, args.mask_fps, args.mask_hold,
-                    args.margin_pixels, args.mask_fill,
-                    min_distinct_captions=args.min_distinct_captions,
-                    alignment=args.alignment)
+                try:
+                    mask = mask_video(
+                        source, temporary, args.crf, args.preset, band_top,
+                        estimate.caption_tracks, args.mask_fps, args.mask_hold,
+                        args.margin_pixels, args.mask_fill,
+                        min_distinct_captions=args.min_distinct_captions,
+                        alignment=args.alignment, max_height=args.max_height)
+                except av.FFmpegError as exc:
+                    raise ValueError("Mask export failed: " + str(exc)) from exc
             else:
+                ffmpeg = ffmpeg_executable(args.ffmpeg)
                 subprocess.run(make_command(ffmpeg, source, temporary, args.mode,
-                                            percent, args.crf, args.preset), check=True)
+                                            percent, args.crf, args.preset, args.max_height), check=True)
             rename_original(source, original)
             os.replace(str(temporary), str(target))
         finally:
@@ -147,6 +153,8 @@ def process_video(source, args):
         "forced": args.force_process,
         "output": target.name if target else None,
         "mode": args.mode if target else None,
+        "max_height": args.max_height if target else None,
+        "crf": args.crf if target else None,
         "bottom_percent": percent if has_subtitles else None,
         "detection": estimate.as_dict(),
     }
@@ -158,29 +166,31 @@ def process_video(source, args):
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
-def video_filter(mode, percent):
+def video_filter(mode, percent, max_height=DEFAULT_MAX_HEIGHT):
     fraction = percent / 100
     # Chroma-subsampled H.264 needs an even output height.
     band = "trunc(ih*{:.6f}/2)*2".format(fraction)
     if mode == "crop":
         kept = "trunc(ih*(1-{:.6f})/2)*2".format(fraction)
-        return "-vf", "crop=iw:{}:0:0".format(kept), "0:v:0"
+        return "-vf", "crop=iw:{}:0:0,{}".format(kept, scale_filter(max_height)), "0:v:0"
     graph = (
         "[0:v:0]split=2[base][source];"
         "[source]crop=iw:{}:0:ih-oh,gblur=sigma=18[band];"
-        "[base][band]overlay=0:H-h:shortest=1[v]"
-    ).format(band)
+        "[base][band]overlay=0:H-h:shortest=1,{}[v]"
+    ).format(band, scale_filter(max_height))
     return "-filter_complex", graph, "[v]"
 
 
-def make_command(ffmpeg, source, destination, mode, percent, crf, preset):
-    filter_flag, filter_value, video_map = video_filter(mode, percent)
+def make_command(ffmpeg, source, destination, mode, percent, crf, preset, max_height=DEFAULT_MAX_HEIGHT):
+    filter_flag, filter_value, video_map = video_filter(mode, percent, max_height)
     return [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y",
-        "-i", str(source), filter_flag, filter_value,
+        "-copyts", "-i", str(source), filter_flag, filter_value,
         "-map", video_map, "-map", "0:a?", "-sn", "-dn",
         "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
         "-pix_fmt", "yuv420p", "-c:a", "copy",
+        "-fps_mode:v", "passthrough", "-enc_time_base:v", "filter",
+        "-avoid_negative_ts", "disabled", "-movie_timescale", "1000000",
         "-movflags", "+faststart", str(destination),
     ]
 
@@ -215,15 +225,19 @@ def main(argv=None):
                         help="maximum OCR samples per video (default: 600)")
     parser.add_argument("--margin-pixels", type=int, default=8,
                         help="extra pixels above detected text (default: 8)")
-    parser.add_argument("--ffmpeg", help="path to FFmpeg executable")
-    parser.add_argument("--crf", type=int, default=18,
-                        help="H.264 quality (lower is better; default: 18)")
+    parser.add_argument("--ffmpeg", help="path to FFmpeg executable for crop/blur")
+    parser.add_argument("--max-height", type=int, default=DEFAULT_MAX_HEIGHT,
+                        help="cap the output height without upscaling (default: 480; 0 disables)")
+    parser.add_argument("--crf", type=int, default=DEFAULT_CRF,
+                        help="H.264 quality (lower is better; default: 16)")
     parser.add_argument("--preset", default="medium",
                         choices=("ultrafast", "superfast", "veryfast", "faster",
                                  "fast", "medium", "slow", "slower", "veryslow"))
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if args.max_height < 0 or args.max_height % 2:
+            raise ValueError("--max-height must be zero or a positive even number")
         if not 0 <= args.crf <= 51:
             raise ValueError("CRF must be between 0 and 51")
         if args.sample_interval <= 0 or args.max_samples < 1 or args.margin_pixels < 0:

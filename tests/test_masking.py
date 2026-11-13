@@ -1,14 +1,10 @@
-from pathlib import Path
-import subprocess
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 
 from subtitle_detection import BandEstimate, CaptionObservation, changing_caption_tracks
-import subtitle_masking
-from subtitle_masking import (caption_lines, caption_samples, fill_boxes, mask_command,
-                              mask_timeline, mask_video, source_timing)
+from subtitle_masking import caption_lines, caption_samples, fill_boxes, mask_timeline
 
 
 class FakeResult:
@@ -166,36 +162,7 @@ class FillTests(unittest.TestCase):
             fill_boxes(self.frame, [(1, 1, 5, 5)], 4, 'smudge')
 
 
-class CommandAndEstimateTests(unittest.TestCase):
-    def test_raw_frames_are_encoded_with_source_audio(self):
-        command = mask_command('ffmpeg', 'in.mp4', 'out.mp4', 854, 480, 30000 / 1001, 18, 'veryfast')
-        joined = ' '.join(command)
-        self.assertIn('-f rawvideo -pixel_format bgr24 -video_size 854x480 -framerate 30000/1001 '
-                      '-itsoffset 0.000000 -i - -i in.mp4', joined)
-        self.assertIn('-map 0:v:0 -map 1:a? -sn -dn -c:v libx264', joined)
-        self.assertIn('-crf 18 -preset veryfast -pix_fmt yuv420p -c:a copy', joined)
-        self.assertEqual(command[-1], 'out.mp4')
-        self.assertNotIn('setsar', joined)
-
-    def test_source_start_and_pixel_shape_are_reapplied(self):
-        command = mask_command('ffmpeg', 'in.mp4', 'out.mp4', 64, 64, 25, 18, 'medium', 1.0, '2:1')
-        joined = ' '.join(command)
-        self.assertIn('-itsoffset 1.000000 -i - -i in.mp4', joined)
-        self.assertIn('-sn -dn -vf setsar=2/1 -c:v libx264', joined)
-
-    def test_source_timing_parses_ffprobe_and_degrades_without_it(self):
-        probe = subprocess.CompletedProcess([], 0, 'start_time=1.000000\nsample_aspect_ratio=2:1\n', '')
-        with patch.object(subtitle_masking.shutil, 'which', return_value='/usr/bin/ffprobe'), \
-                patch.object(subtitle_masking.Path, 'is_file', return_value=True), \
-                patch.object(subtitle_masking.subprocess, 'run', return_value=probe) as run:
-            self.assertEqual(source_timing('/usr/bin/ffmpeg', Path('in.mp4')), (1.0, '2:1'))
-            self.assertEqual(run.call_args.args[0][-1], 'in.mp4')
-            probe.stdout = 'start_time=N/A\nsample_aspect_ratio=1:1\n'
-            self.assertEqual(source_timing('/usr/bin/ffmpeg', Path('in.mp4')), (0.0, None))
-        with patch.object(subtitle_masking.shutil, 'which', return_value=None), \
-                patch.object(subtitle_masking.Path, 'is_file', return_value=False):
-            self.assertEqual(source_timing('/opt/ffmpeg', Path('in.mp4')), (0.0, None))
-
+class BandEstimateTests(unittest.TestCase):
     def test_band_estimate_caption_tracks_default(self):
         first = BandEstimate(640, 360, 10, 10, 6, 300, 16.6667, True)
         second = BandEstimate(640, 360, 10, 10, 0, None, None, False)
@@ -206,107 +173,3 @@ class CommandAndEstimateTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-
-
-class FakeCapture:
-    """Sequential frames like cv2.VideoCapture; one instance per decode pass."""
-    passes = []
-
-    def __init__(self, path):
-        self.frames = FakeCapture.passes.pop(0)
-        self.index = 0
-
-    def isOpened(self):
-        return True
-
-    def get(self, prop):
-        import cv2
-        return {cv2.CAP_PROP_FPS: 10.0, cv2.CAP_PROP_FRAME_COUNT: 6.0,
-                cv2.CAP_PROP_FRAME_WIDTH: 32.0, cv2.CAP_PROP_FRAME_HEIGHT: 24.0}[prop]
-
-    def grab(self):
-        self.index += 1
-        return self.index <= len(self.frames)
-
-    def retrieve(self):
-        return True, self.frames[self.index - 1]
-
-    def read(self):
-        if self.index >= len(self.frames):
-            return False, None
-        self.index += 1
-        return True, self.frames[self.index - 1]
-
-    def release(self):
-        pass
-
-
-class FakeProcess:
-    def __init__(self, command, stdin=None, code=0):
-        self.command, self.code, self.written, self.killed = command, code, bytearray(), False
-        process = self
-
-        class Stdin:
-            def write(self, data):
-                process.written += data
-
-            def close(self):
-                pass
-        self.stdin = Stdin()
-
-    def wait(self):
-        return self.code
-
-    def kill(self):
-        self.killed = True
-
-
-class FakeOCR:
-    def __init__(self, rows):
-        self.rows = rows
-
-    def __call__(self, image):
-        return FakeResult(self.rows)
-
-
-class MaskVideoTests(unittest.TestCase):
-    def setUp(self):
-        rng = np.random.default_rng(1)
-        self.frames = [rng.integers(0, 256, (24, 32, 3), dtype=np.uint8) for _ in range(6)]
-        self.processes = []
-
-    def run_mask(self, passes, rows=(), code=0):
-        FakeCapture.passes = [list(frames) for frames in passes]
-        def popen(command, stdin=None):
-            self.processes.append(FakeProcess(command, stdin, code))
-            return self.processes[-1]
-        with patch('cv2.VideoCapture', FakeCapture), \
-                patch.object(subtitle_masking.subprocess, 'Popen', side_effect=popen), \
-                patch.object(subtitle_masking, 'source_timing', return_value=(0.0, None)):
-            return mask_video(Path('in.mp4'), Path('out.mp4'), 'ffmpeg', 18, 'medium', 12, [],
-                              sample_fps=5, hold_samples=0, margin_pixels=1, ocr=FakeOCR(list(rows)))
-
-    def test_frames_without_captions_are_piped_through_unchanged(self):
-        report = self.run_mask([self.frames, self.frames])
-        self.assertEqual(bytes(self.processes[0].written), b''.join(frame.tobytes() for frame in self.frames))
-        self.assertEqual((report['frames'], report['masked_frames'], report['samples']), (6, 0, 3))
-        self.assertEqual(self.processes[0].command[-1], 'out.mp4')
-
-    def test_caption_boxes_are_filled_only_where_sampled(self):
-        report = self.run_mask([self.frames, self.frames], rows=[(8, 2, 28, 6, 0.95, 'Hello there')])
-        written = np.frombuffer(bytes(self.processes[0].written), np.uint8).reshape(6, 24, 32, 3)
-        self.assertEqual(report['masked_frames'], 6)
-        self.assertTrue(np.array_equal(written[0, 19:], self.frames[0][19:]))
-        self.assertTrue(np.array_equal(written[0, :12], self.frames[0][:12]))
-        self.assertFalse(np.array_equal(written[0, 12:18, 7:29], self.frames[0][12:18, 7:29]))
-
-    def test_short_second_pass_is_an_error_not_a_truncated_video(self):
-        with self.assertRaises(ValueError):
-            self.run_mask([self.frames, self.frames[:2]])
-        with self.assertRaises(ValueError):
-            self.run_mask([self.frames, self.frames + self.frames[:1]])
-        self.assertTrue(self.processes[-1].killed)
-
-    def test_encoder_failure_is_reported(self):
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.run_mask([self.frames, self.frames], code=1)

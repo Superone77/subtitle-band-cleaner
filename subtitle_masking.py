@@ -1,13 +1,10 @@
 """Mask detected caption text boxes only in frames where captions are shown."""
 
-from contextlib import suppress
 from fractions import Fraction
 from math import ceil, floor
-from pathlib import Path
-import shutil
-import subprocess
 
 from subtitle_detection import CaptionObservation, changing_caption_tracks, normalized_text
+from video_export import DEFAULT_MAX_HEIGHT, export_size
 
 
 FILLS = ("blur", "pixelate", "inpaint")
@@ -168,60 +165,122 @@ def fill_boxes(frame, boxes, margin_pixels=8, fill="blur"):
     return output
 
 
-def source_timing(ffmpeg, source):
-    """Return the video stream's start time and sample aspect ratio via ffprobe.
 
-    Raw frames carry neither, so they are re-applied on encoding. Without
-    ffprobe (imageio-ffmpeg ships only ffmpeg) both fall back to defaults.
-    """
-    ffprobe = shutil.which("ffprobe") or Path(ffmpeg).with_name("ffprobe")
-    if not Path(ffprobe).is_file():
-        return 0.0, None
-    try:
-        probe = subprocess.run(
-            [str(ffprobe), "-v", "error", "-select_streams", "v:0", "-show_entries",
-             "stream=start_time,sample_aspect_ratio", "-of", "default=nw=1", str(source)],
-            capture_output=True, text=True, check=True).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return 0.0, None
-    values = dict(line.split("=", 1) for line in probe.splitlines() if "=" in line)
-    try:
-        start = max(0.0, float(values.get("start_time", 0)))
-    except ValueError:
-        start = 0.0
-    sar = values.get("sample_aspect_ratio", "")
-    ratio = sar.split(":") if ":" in sar else None
-    if not ratio or not all(part.isdigit() for part in ratio) or "0" in ratio or ratio[0] == ratio[1]:
-        sar = None
-    return start, sar
+def displayed_array(frame):
+    import numpy as np
+
+    array = frame.to_ndarray(format="bgr24")
+    return np.ascontiguousarray(np.rot90(array, frame.rotation // 90)) if frame.rotation else array
 
 
-def mask_command(ffmpeg, source, destination, width, height, fps, crf, preset, start=0.0, sar=None):
-    """Encode raw frames from stdin, keeping the source's audio, start time and pixel shape."""
-    command = [
-        ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y",
-        "-f", "rawvideo", "-pixel_format", "bgr24",
-        "-video_size", "{}x{}".format(width, height),
-        "-framerate", str(Fraction(fps).limit_denominator(10000)),
-        "-itsoffset", "{:.6f}".format(start), "-i", "-", "-i", str(source),
-        "-map", "0:v:0", "-map", "1:a?", "-sn", "-dn",
-    ]
-    if sar:
-        command += ["-vf", "setsar=" + sar.replace(":", "/")]
-    return command + [
-        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
-        "-pix_fmt", "yuv420p", "-c:a", "copy",
-        "-movflags", "+faststart", str(destination),
-    ]
+def yuv_with_boxes(frame, boxes, margin_pixels, fill, colorspace, color_range):
+    """Copy the converted mask only into its affected luma/chroma rectangles."""
+    import av
+    import numpy as np
+
+    base = frame.reformat(format="yuv420p")
+    if not boxes and not frame.rotation:
+        return base
+    pixels = displayed_array(frame)
+    if boxes:
+        pixels = fill_boxes(pixels, boxes, margin_pixels, fill)
+    converted = av.VideoFrame.from_ndarray(pixels, format="bgr24").reformat(
+        format="yuv420p", dst_colorspace=colorspace, dst_color_range=color_range)
+    if frame.rotation:
+        return converted
+    # Decoder-owned planes can be referenced by later frames, so do not
+    # mutate base. The new frame owns all of its planes.
+    output = av.VideoFrame(base.width, base.height, "yuv420p")
+    for index, (old, patch, target) in enumerate(zip(base.planes, converted.planes, output.planes)):
+        def view(plane):
+            return np.ndarray((plane.height, plane.line_size), np.uint8,
+                              buffer=plane)[:, :plane.width]
+        region, replacement = view(target), view(patch)
+        region[:] = view(old)
+        factor = 2 if index else 1
+        for x0, y0, x1, y1 in boxes:
+            area = np.s_[max(0, (y0 - margin_pixels) // factor):ceil((y1 + margin_pixels) / factor),
+                         max(0, (x0 - margin_pixels) // factor):ceil((x1 + margin_pixels) / factor)]
+            region[area] = replacement[area]
+    return output
 
 
-def mask_video(source, destination, ffmpeg, crf, preset, band_top, caption_tracks,
+def write_masked_video(source, destination, timeline, crf, preset, margin_pixels, fill,
+                       max_height, native, turned):
+    """Encode with the original video PTS and mux untouched source audio packets."""
+    import av
+    from av.video.reformatter import ColorRange, Colorspace
+
+    options = {"movflags": "+faststart", "avoid_negative_ts": "disabled",
+               "movie_timescale": "1000000"}
+    with av.open(str(source)) as src, av.open(str(destination), "w", options=options) as out:
+        video = src.streams.video[0]
+        codec = video.codec_context
+        rate = video.average_rate or video.guessed_rate or Fraction(25)
+        encoded = out.add_stream("libx264", rate=rate)
+        encoded.width, encoded.height = export_size(*native, max_height)
+        encoded.codec_context.time_base = encoded.time_base = video.time_base
+        encoded.options = {"crf": str(crf), "preset": preset}
+        encoded.pix_fmt = "yuv420p"
+        for name in ("color_range", "colorspace", "color_trc", "color_primaries"):
+            setattr(encoded.codec_context, name, getattr(codec, name))
+        try:
+            colorspace = Colorspace(codec.colorspace)
+        except ValueError:
+            colorspace = None
+        color_range = ColorRange(codec.color_range) if codec.color_range in (1, 2) else None
+        sar = Fraction(video.sample_aspect_ratio or 1)
+        width, height = native
+        encoded.codec_context.sample_aspect_ratio = (
+            (1 / sar if turned else sar) * Fraction(width * encoded.height, height * encoded.width))
+        audio = {stream.index: out.add_stream_from_template(stream) for stream in src.streams.audio}
+        durations = {}
+        frames = 0
+
+        def mux(packets):
+            for packet in packets:
+                duration = durations.pop(packet.pts, 0)
+                if duration > 0:
+                    packet.duration = duration
+                out.mux(packet)
+
+        for packet in src.demux(video, *src.streams.audio):
+            if packet.stream.index in audio:
+                if packet.dts is not None:
+                    packet.stream = audio[packet.stream.index]
+                    out.mux(packet)
+                continue
+            for frame in packet.decode():
+                if frames >= len(timeline):
+                    raise ValueError("Second decode pass returned more frames than the first: " + str(source))
+                if frame.pts is None or frame.time_base is None:
+                    raise ValueError("Video frame has no presentation timestamp: " + str(source))
+                rotated = frame.rotation % 180 != 0
+                size = (frame.height, frame.width) if rotated else (frame.width, frame.height)
+                if size != native:
+                    raise ValueError("Frame size changed while decoding: " + str(source))
+                pts = round(frame.pts * frame.time_base / video.time_base)
+                duration = round(frame.duration * frame.time_base / video.time_base)
+                output = yuv_with_boxes(frame, timeline[frames], margin_pixels, fill, colorspace, color_range)
+                output = output.reformat(encoded.width, encoded.height, "yuv420p",
+                                         interpolation="LANCZOS")
+                output.pts, output.time_base, output.duration = pts, video.time_base, duration
+                durations[pts] = duration
+                mux(encoded.encode(output))
+                frames += 1
+        if frames != len(timeline):
+            raise ValueError("Second decode pass returned {} of {} frames: {}".format(
+                frames, len(timeline), source))
+        mux(encoded.encode())
+        return frames, encoded.width, encoded.height
+
+
+def mask_video(source, destination, crf, preset, band_top, caption_tracks,
                sample_fps=5.0, hold_samples=3, margin_pixels=8, fill="blur",
-               min_confidence=0.80, min_distinct_captions=3, alignment="center", ocr=None):
-    """OCR the band, then re-encode with caption boxes masked frame by frame.
-
-    Frames without caption boxes pass through unchanged before encoding.
-    """
+               min_confidence=0.80, min_distinct_captions=3, alignment="center", ocr=None,
+               max_height=DEFAULT_MAX_HEIGHT):
+    """OCR the band, then re-encode with caption boxes masked frame by frame."""
+    import av
     import cv2
 
     if sample_fps <= 0 or hold_samples < 0 or margin_pixels < 0 or min_distinct_captions < 1:
@@ -230,99 +289,54 @@ def mask_video(source, destination, ffmpeg, crf, preset, band_top, caption_track
         raise ValueError("Fill must be one of: " + ", ".join(FILLS))
     if alignment not in {"center", "any"}:
         raise ValueError("Alignment must be center or any")
-    capture = cv2.VideoCapture(str(source))
-    if not capture.isOpened():
-        raise ValueError("Cannot decode video: " + str(source))
-    try:
-        fps = capture.get(cv2.CAP_PROP_FPS)
-        frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
-        width = round(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if fps <= 0 or frame_count <= 0 or width <= 0 or height <= 0:
-            raise ValueError("Cannot read video timing or dimensions: " + str(source))
-        if not 0 <= band_top < height:
-            raise ValueError("Band top is outside the frame: " + str(band_top))
-        step = max(1, round(fps / sample_fps))
-        crop_top = max(0, band_top - margin_pixels)
-        if ocr is None:
-            from rapidocr import RapidOCR
+    if ocr is None:
+        from rapidocr import RapidOCR
 
-            # The default min side limit upscales a short band crop and is much slower;
-            # empty band crops are normal here, so skip RapidOCR's per-frame warning.
-            ocr = RapidOCR(params={"Det.limit_type": "max", "Det.limit_side_len": 960,
-                                   "Global.log_level": "error"})
+        ocr = RapidOCR(params={"Det.limit_type": "max", "Det.limit_side_len": 960,
+                               "Global.log_level": "error"})
+    samples = []
+    frames = 0
+    with av.open(str(source)) as capture:
+        if not capture.streams.video:
+            raise ValueError("Cannot decode video: " + str(source))
+        stream = capture.streams.video[0]
+        step = max(1, round(float(stream.average_rate or stream.guessed_rate or 25) / sample_fps))
+        crop_top = max(0, band_top - margin_pixels)
         print("{}: mask pass 1/2, OCR every {} frames below y={}".format(
             source.name, step, crop_top), flush=True)
-        samples = []
-        frames = 0
-        while capture.grab():
+        for frame in capture.decode(stream):
             if frames % step == 0:
-                ok, frame = capture.retrieve()
-                if not ok:
-                    raise ValueError("Cannot decode frame {} of {}".format(frames, source))
-                band = cv2.copyMakeBorder(frame[crop_top:, :], 0, OCR_PADDING, 0, 0,
+                pixels = displayed_array(frame)
+                height, width = pixels.shape[:2]
+                if frames == 0:
+                    native = width, height
+                    turned = frame.rotation % 180 != 0
+                if not 0 <= band_top < height:
+                    raise ValueError("Band top is outside the frame: " + str(band_top))
+                band = cv2.copyMakeBorder(pixels[crop_top:, :], 0, OCR_PADDING, 0, 0,
                                           cv2.BORDER_CONSTANT, value=0)
                 samples.append(caption_lines(
                     ocr(band), crop_top, width, height, caption_tracks,
-                    frames / fps, min_confidence, alignment))
+                    frame.time or 0.0, min_confidence, alignment))
             frames += 1
-    finally:
-        capture.release()
-    if frames < max(1, ceil(frame_count * 0.8)):
-        raise ValueError("Too many frames could not be decoded: " + str(source))
-    if caption_tracks:
-        sample_boxes = caption_samples(samples, width, height, min_distinct_captions)
-    else:
-        sample_boxes = [boxes for boxes, _ in samples]
+        if frames < max(1, ceil(stream.frames * 0.8)):
+            raise ValueError("Too many frames could not be decoded: " + str(source))
+    sample_boxes = (caption_samples(samples, width, height, min_distinct_captions)
+                    if caption_tracks else [boxes for boxes, _ in samples])
     timeline = mask_timeline(sample_boxes, step, frames, hold_samples)
-    report = {
+    masked_frames = sum(bool(boxes) for boxes in timeline)
+    print("{}: mask pass 2/2, {} on {} of {} frames".format(
+        source.name, fill, masked_frames, frames), flush=True)
+    frames, output_width, output_height = write_masked_video(
+        source, destination, timeline, crf, preset, margin_pixels, fill, max_height, native, turned)
+    return {
         "fill": fill,
         "sample_fps": sample_fps,
         "hold_samples": hold_samples,
         "samples": len(samples),
-        "samples_with_captions": sum(1 for boxes in sample_boxes if boxes),
-        "frames": 0,
-        "masked_frames": 0,
+        "samples_with_captions": sum(bool(boxes) for boxes in sample_boxes),
+        "frames": frames,
+        "masked_frames": masked_frames,
+        "width": output_width,
+        "height": output_height,
     }
-    print("{}: mask pass 2/2, {} on {} of {} frames ({} of {} samples with captions)".format(
-        source.name, fill, sum(1 for boxes in timeline if boxes), frames,
-        report["samples_with_captions"], report["samples"]), flush=True)
-    capture = cv2.VideoCapture(str(source))
-    if not capture.isOpened():
-        raise ValueError("Cannot decode video: " + str(source))
-    start, sar = source_timing(ffmpeg, source)
-    command = mask_command(ffmpeg, source, destination, width, height, fps, crf, preset, start, sar)
-    process = subprocess.Popen(command, stdin=subprocess.PIPE)
-    try:
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            if report["frames"] >= frames:
-                raise ValueError("Second decode pass returned more frames than the first: " + str(source))
-            if frame.shape != (height, width, 3):
-                raise ValueError("Frame size changed while decoding: " + str(source))
-            boxes = timeline[report["frames"]]
-            if boxes:
-                frame = fill_boxes(frame, boxes, margin_pixels, fill)
-            try:
-                process.stdin.write(frame.tobytes())
-            except BrokenPipeError:
-                break
-            report["frames"] += 1
-            report["masked_frames"] += bool(boxes)
-        with suppress(BrokenPipeError):
-            process.stdin.close()
-    except BaseException:
-        process.kill()
-        process.wait()
-        raise
-    finally:
-        capture.release()
-    code = process.wait()
-    if code:
-        raise subprocess.CalledProcessError(code, command)
-    if report["frames"] != frames:
-        raise ValueError("Second decode pass returned {} of {} frames: {}".format(
-            report["frames"], frames, source))
-    return report
